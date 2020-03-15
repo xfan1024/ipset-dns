@@ -39,6 +39,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
+#include <getopt.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/nameser.h>
@@ -299,6 +301,37 @@ close:
 #endif
 }
 
+static int test_in_ipset(const char *setname, const char *ip)
+{
+	// I am not sure how to use netlink or raw socket to 
+	// implement this correctly, so I use ipset command instead
+
+	if (!setname)
+		return -1;
+	char command[512];
+	int retcode;
+	snprintf(command, sizeof(command), "ipset test %s \'%s\' 1>&- 2>&-", setname, ip);
+	retcode = system(command);
+	printf("(retcode %d) %s\n", retcode, command);
+	return retcode;
+}
+
+void usage(const char *prog)
+{
+	fprintf(stderr, "Usage: %s ipv4-ipset ipv6-ipset port upstream [additional options]\n", prog);
+	fprintf(stderr, "    --ipv4-excl=<tablename>       do not add to ipv4-ipset if target ipv4 exists in this table\n");
+	fprintf(stderr, "    --ipv6-excl=<tablename>       do not add to ipv6-ipset if target ipv6 exists in this table\n");
+	fprintf(stderr, "    --upstream-port=<port>        dns upstream port\n");
+}
+
+enum
+{
+	__OPT_BEGIN = 1000,
+	OPT_IPV4_EXCL,
+	OPT_IPV6_EXCL,
+	OPT_UPSTREAM_PORT,
+};
+
 int main(int argc, char *argv[]) 
 {
 	struct sockaddr_in client_addr, listen_addr, upstream_addr;
@@ -308,19 +341,53 @@ int main(int argc, char *argv[])
 	char msg[512];
 	char ip[INET6_ADDRSTRLEN];
 	char *ipset4, *ipset6;
+	char *eipset4, *eipset6;
 	int listen_sock, upstream_sock;
 	int pos, i, size, af;
 	socklen_t len;
 	size_t received;
 	pid_t child;
-	
-	if (argc != 5) {
-		fprintf(stderr, "Usage: %s ipv4-ipset ipv6-ipset port upstream\n", argv[0]);
-		return 1;
+	int longidx = 0;
+	int opt;
+	int upstream_port;
+	char **args;
+
+	static struct option longopts[] = {
+		{"ipv4-excl", required_argument, NULL, OPT_IPV4_EXCL},
+		{"ipv6-excl", required_argument, NULL, OPT_IPV6_EXCL},
+		{"upstream-port", required_argument, NULL, OPT_UPSTREAM_PORT},
+	};
+
+	eipset4 = eipset6 = NULL;
+	upstream_port = 53;
+	while ((opt = getopt_long(argc, argv, "", longopts, &longidx)) != -1)
+	{
+		switch (opt)
+		{
+		case OPT_IPV4_EXCL:
+			eipset4 = optarg;
+			break;
+		case OPT_IPV6_EXCL:
+			eipset6 = optarg;
+			break;
+		case OPT_UPSTREAM_PORT:
+			upstream_port = atoi(optarg);
+			break;
+        default:
+            usage(argv[0]);
+            return 1;
+		}
 	}
 
-	ipset4 = argv[1];
-	ipset6 = argv[2];
+	if (argc < 4 + optind)
+    {
+		usage(argv[0]);
+		return 1;
+	}
+    args = argv + optind;
+
+	ipset4 = args[0];
+	ipset6 = args[1];
 
 	if (!*ipset4 && !*ipset6) {
 		fprintf(stderr, "At least one of ipv4-ipset and ipv6-ipset must be provided.\n");
@@ -335,7 +402,7 @@ int main(int argc, char *argv[])
 
 	memset(&listen_addr, 0, sizeof(listen_addr));
 	listen_addr.sin_family = AF_INET;
-	listen_addr.sin_port = htons(atoi(argv[3]));
+	listen_addr.sin_port = htons(atoi(args[2]));
 	listen_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	i = 1;
 	setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &i, sizeof(i));
@@ -346,8 +413,8 @@ int main(int argc, char *argv[])
 	
 	memset(&upstream_addr, 0, sizeof(upstream_addr));
 	upstream_addr.sin_family = AF_INET;
-	upstream_addr.sin_port = htons(53);
-	inet_aton(argv[4], &upstream_addr.sin_addr);
+	upstream_addr.sin_port = htons(upstream_port);
+	inet_aton(args[3], &upstream_addr.sin_addr);
 	
 	/* TODO: Put all of the below code in several forks all listening on the same sock. */
 
@@ -444,6 +511,8 @@ int main(int argc, char *argv[])
 				continue;
 
 			printf("%s: %s\n", answer.dotted, ip);
+			if (test_in_ipset((af == AF_INET) ? eipset4 : eipset6, ip) == 0)
+				continue;
 			if (add_to_ipset((af == AF_INET) ? ipset4 : ipset6, answer.rdata, af) < 0)
 				perror("add_to_ipset");
 		}
